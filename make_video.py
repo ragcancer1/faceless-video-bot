@@ -43,7 +43,7 @@ def rewrite_script(transcript):
     Return ONLY valid JSON: {{"scenes": [{{"narration": "...", "visual_action": "..."}}]}}
     Transcript: {transcript}
     """
-    for model in ["gemini-2.5-flash", "gemini-2.0-flash"]:
+    for model in ["gemini-3.8-flash"]:
         url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
         res = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}).json()
         if "candidates" in res:
