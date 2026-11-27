@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import asyncio
 import requests
 import yt_dlp
@@ -43,13 +44,30 @@ def rewrite_script(transcript):
     Return ONLY valid JSON: {{"scenes": [{{"narration": "...", "visual_action": "..."}}]}}
     Transcript: {transcript}
     """
-    for model in ["gemini-3.8-flash"]:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
-        res = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}).json()
+    # 1. Try Gemini 3.8 Flash (with 3 retries for 503 high demand)
+    gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key={GEMINI_API_KEY}"
+    for attempt in range(3):
+        res = requests.post(gemini_url, json={"contents": [{"parts": [{"text": prompt}]}]}).json()
         if "candidates" in res:
             raw = res["candidates"][0]["content"]["parts"][0]["text"].replace("```json", "").replace("```", "").strip()
             return json.loads(raw)["scenes"]
-    raise Exception(f"Gemini API Error: {res}")
+        time.sleep(5)
+
+    # 2. Automatic Fallback to Groq Llama-3.3-70B if Gemini is busy
+    groq_res = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
+        json={
+            "model": "llama-3.3-70b-versatile",
+            "messages": [{"role": "user", "content": prompt}],
+            "response_format": {"type": "json_object"}
+        }
+    ).json()
+    if "choices" in groq_res:
+        raw = groq_res["choices"][0]["message"]["content"].strip()
+        return json.loads(raw)["scenes"]
+
+    raise Exception(f"Both APIs failed. Gemini: {res} | Groq: {groq_res}")
 
 async def generate_voice(text, path):
     await edge_tts.Communicate(text, "hi-IN-MadhurNeural", rate="+10%").save(path)
