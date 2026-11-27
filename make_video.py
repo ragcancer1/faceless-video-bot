@@ -44,30 +44,42 @@ def rewrite_script(transcript):
     Return ONLY valid JSON: {{"scenes": [{{"narration": "...", "visual_action": "..."}}]}}
     Transcript: {transcript}
     """
-    # 1. Try Gemini 3.8 Flash (with 3 retries for 503 high demand)
-    gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent?key={GEMINI_API_KEY}"
-    for attempt in range(3):
-        res = requests.post(gemini_url, json={"contents": [{"parts": [{"text": prompt}]}]}).json()
-        if "candidates" in res:
-            raw = res["candidates"][0]["content"]["parts"][0]["text"].replace("```json", "").replace("```", "").strip()
+    # 1. Try Gemini Models (with retry)
+    gemini_res = {}
+    for model in ["gemini-3.8-flash", "gemini-2.5-flash-lite"]:
+        gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+        for _ in range(2):
+            gemini_res = requests.post(gemini_url, json={"contents": [{"parts": [{"text": prompt}]}]}).json()
+            if "candidates" in gemini_res:
+                raw = gemini_res["candidates"][0]["content"]["parts"][0]["text"].replace("```json", "").replace("```", "").strip()
+                return json.loads(raw)["scenes"]
+            time.sleep(3)
+
+    # 2. Auto-detect active Groq text model and run fallback
+    headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
+    models_data = requests.get("https://api.groq.com/openai/v1/models", headers=headers).json()
+    available_models = [
+        m["id"] for m in models_data.get("data", [])
+        if any(k in m["id"].lower() for k in ["llama", "qwen", "gemma", "deepseek"])
+        and "whisper" not in m["id"].lower() and "guard" not in m["id"].lower()
+    ]
+    
+    groq_res = {}
+    for g_model in available_models:
+        groq_res = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers,
+            json={
+                "model": g_model,
+                "messages": [{"role": "user", "content": prompt}],
+                "response_format": {"type": "json_object"}
+            }
+        ).json()
+        if "choices" in groq_res:
+            raw = groq_res["choices"][0]["message"]["content"].strip()
             return json.loads(raw)["scenes"]
-        time.sleep(5)
 
-    # 2. Automatic Fallback to Groq Llama-3.3-70B if Gemini is busy
-    groq_res = requests.post(
-        "https://api.groq.com/openai/v1/chat/completions",
-        headers={"Authorization": f"Bearer {GROQ_API_KEY}"},
-        json={
-            "model": "llama-3.3-70b-versatile",
-            "messages": [{"role": "user", "content": prompt}],
-            "response_format": {"type": "json_object"}
-        }
-    ).json()
-    if "choices" in groq_res:
-        raw = groq_res["choices"][0]["message"]["content"].strip()
-        return json.loads(raw)["scenes"]
-
-    raise Exception(f"Both APIs failed. Gemini: {res} | Groq: {groq_res}")
+    raise Exception(f"Both APIs failed. Gemini: {gemini_res} | Groq: {groq_res}")
 
 async def generate_voice(text, path):
     await edge_tts.Communicate(text, "hi-IN-MadhurNeural", rate="+10%").save(path)
