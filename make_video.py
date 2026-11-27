@@ -1,10 +1,12 @@
 import os
+import io
 import json
 import time
 import asyncio
 import requests
 import yt_dlp
 import edge_tts
+from PIL import Image, ImageDraw
 from moviepy import ImageClip, AudioFileClip, concatenate_videoclips
 
 GROQ_API_KEY = os.environ["GROQ_API_KEY"].strip()
@@ -44,18 +46,16 @@ def rewrite_script(transcript):
     Return ONLY valid JSON: {{"scenes": [{{"narration": "...", "visual_action": "..."}}]}}
     Transcript: {transcript}
     """
-    # 1. Try Gemini Models (with retry)
     gemini_res = {}
     for model in ["gemini-3.8-flash", "gemini-2.5-flash-lite"]:
         gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
         for _ in range(2):
             gemini_res = requests.post(gemini_url, json={"contents": [{"parts": [{"text": prompt}]}]}).json()
             if "candidates" in gemini_res:
-                raw = gemini_res["candidates"][0]["content"]["parts"][0]["text"].replace("```json", "").replace("```", "").strip()
+                raw = res_text = gemini_res["candidates"][0]["content"]["parts"][0]["text"].replace("```json", "").replace("```", "").strip()
                 return json.loads(raw)["scenes"]
             time.sleep(3)
 
-    # 2. Auto-detect active Groq text model and run fallback
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
     models_data = requests.get("https://api.groq.com/openai/v1/models", headers=headers).json()
     available_models = [
@@ -84,11 +84,29 @@ def rewrite_script(transcript):
 async def generate_voice(text, path):
     await edge_tts.Communicate(text, "hi-IN-MadhurNeural", rate="+10%").save(path)
 
-def generate_image(action, path):
+def generate_image(action, path, idx):
     prompt = requests.utils.quote(f"{CHARACTER_STYLE}, {action}")
-    img = requests.get(f"https://image.pollinations.ai/prompt/{prompt}?width=720&height=1280&nologo=true&seed=42").content
-    with open(path, "wb") as f:
-        f.write(img)
+    urls = [
+        f"https://image.pollinations.ai/prompt/{prompt}?width=720&height=1280&model=flux&nologo=true&seed={42+idx}",
+        f"https://pollinations.ai/p/{prompt}?width=720&height=1280&nologo=true&seed={42+idx}"
+    ]
+    for url in urls:
+        for _ in range(2):
+            try:
+                res = requests.get(url, timeout=25)
+                if res.status_code == 200 and len(res.content) > 5000:
+                    img = Image.open(io.BytesIO(res.content)).convert("RGB")
+                    img.save(path, "JPEG", quality=92)
+                    return
+            except Exception:
+                pass
+            time.sleep(2)
+
+    # Fallback clean dark studio frame if image server times out
+    fallback = Image.new("RGB", (720, 1280), color=(20, 28, 48))
+    draw = ImageDraw.Draw(fallback)
+    draw.rectangle([40, 40, 680, 1240], outline=(80, 140, 255), width=6)
+    fallback.save(path, "JPEG", quality=92)
 
 async def main():
     audio_file = download_audio(VIDEO_URL)
@@ -99,7 +117,7 @@ async def main():
     for idx, scene in enumerate(scenes):
         v_path, i_path = f"temp/v_{idx}.mp3", f"temp/i_{idx}.jpg"
         await generate_voice(scene["narration"], v_path)
-        generate_image(scene["visual_action"], i_path)
+        generate_image(scene["visual_action"], i_path, idx)
 
         a_clip = AudioFileClip(v_path)
         i_clip = ImageClip(i_path).with_duration(a_clip.duration).resized(lambda t: 1 + 0.04 * t).with_position(('center', 'center'))
