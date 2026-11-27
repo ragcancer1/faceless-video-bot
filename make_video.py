@@ -2,12 +2,11 @@ import os
 import io
 import json
 import time
-import textwrap
 import asyncio
 import requests
 import yt_dlp
 import edge_tts
-from PIL import Image, ImageDraw, ImageFont, ImageStat
+from PIL import Image, ImageStat
 from moviepy import ImageClip, AudioFileClip, concatenate_videoclips
 
 GROQ_API_KEY = os.environ["GROQ_API_KEY"].strip()
@@ -18,10 +17,10 @@ VIDEO_URL = os.environ["VIDEO_URL"].strip()
 
 os.makedirs("temp", exist_ok=True)
 
-ANIMATION_STYLE = (
-    "3D Pixar and Disney animation movie still, vibrant cinematic lighting, "
-    "rich detailed full-bleed background environment, expressive 3D characters, "
-    "vertical 9:16 composition, Unreal Engine 5 render, 8k, no text, no watermark"
+STYLE_SUFFIX = (
+    "3D Pixar Disney animated movie scene, expressive characters, warm cinematic lighting, "
+    "rich detailed full-bleed background, 9:16 vertical composition, Unreal Engine 5 render, "
+    "vibrant colors, sharp focus, no text, no subtitles, no watermark"
 )
 
 def download_audio(url):
@@ -48,15 +47,15 @@ def transcribe_audio(audio_path):
 
 def rewrite_script(transcript):
     prompt = f"""
-    Rewrite this story/transcript into a gripping 35-second viral Hindi/Hinglish animated story reel with 7 short scenes (each scene 1 short sentence).
+    Rewrite this story/transcript into a gripping 35-second viral Hindi animated story reel with 6 scenes (each scene 1 short punchy sentence).
     
     CRITICAL RULES:
-    1. 'voice_hindi': Write in natural Devanagari Hindi script with Hindi words for ALL numbers (e.g., write "बीस साल" instead of "20 साल", "सात हज़ार" instead of "7000+", "दो रेत के बोरे" instead of "2 sandy bags") so text-to-speech pronounces every word naturally like a human storyteller.
-    2. 'caption_hinglish': Short punchy Hinglish subtitle (max 8-10 words) to display on screen.
-    3. 'visual_prompt': Detailed English scene description for a 3D Pixar animated movie frame. Keep character appearances consistent across all scenes (e.g., "a middle-aged Indian customs officer in khaki uniform with a mustache, and a clever young smuggler wearing a brown jacket pushing a bicycle with sandbags at a border gate"). Describe exact action, camera angle, and full background.
+    1. 'voice_hindi': Write in pure natural Devanagari Hindi script with Hindi words for ALL numbers (e.g., "बीस साल", "सात हज़ार", "दो रेत के बोरे") so text-to-speech sounds completely human and natural.
+    2. 'character_sheet': A single 1-sentence English description of the main character(s) and setting (e.g., "a 45-year-old Indian customs officer with a mustache in a khaki uniform and a young smuggler in a brown jacket with a bicycle carrying two sandbags at a sunlit border gate").
+    3. 'scene_action': Specific English visual action and camera shot (wide shot, medium shot, close-up) for this exact scene, repeating the exact characters from 'character_sheet' so every frame looks like the same animated movie.
 
     Return ONLY valid JSON:
-    {{"scenes": [{{"voice_hindi": "...", "caption_hinglish": "...", "visual_prompt": "..."}}]}}
+    {{"character_sheet": "...", "scenes": [{{"voice_hindi": "...", "scene_action": "..."}}]}}
     
     Transcript: {transcript}
     """
@@ -67,7 +66,7 @@ def rewrite_script(transcript):
             gemini_res = requests.post(gemini_url, json={"contents": [{"parts": [{"text": prompt}]}]}).json()
             if "candidates" in gemini_res:
                 raw = gemini_res["candidates"][0]["content"]["parts"][0]["text"].replace("```json", "").replace("```", "").strip()
-                return json.loads(raw)["scenes"]
+                return json.loads(raw)
             time.sleep(3)
 
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
@@ -91,96 +90,69 @@ def rewrite_script(transcript):
         ).json()
         if "choices" in groq_res:
             raw = groq_res["choices"][0]["message"]["content"].strip()
-            return json.loads(raw)["scenes"]
+            return json.loads(raw)
 
     raise Exception(f"Both APIs failed. Gemini: {gemini_res} | Groq: {groq_res}")
 
 async def generate_voice(text, path):
-    # Natural storytelling voice in Hindi
-    await edge_tts.Communicate(text, "hi-IN-MadhurNeural", rate="+8%", pitch="+0Hz").save(path)
+    await edge_tts.Communicate(text, "hi-IN-MadhurNeural", rate="+6%", pitch="+0Hz").save(path)
 
-def add_bold_subtitle(img, text):
-    draw = ImageDraw.Draw(img, "RGBA")
-    w, h = img.size
-    try:
-        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 42)
-    except Exception:
-        font = ImageFont.load_default()
+def is_valid_artwork(img):
+    stat = ImageStat.Stat(img)
+    mean_brightness = sum(stat.mean) / 3
+    std_dev = sum(stat.stddev) / 3
+    # Reject solid blank frames, pure black, or pure white images
+    return (20 < mean_brightness < 240) and (std_dev > 18)
 
-    lines = textwrap.wrap(text.upper(), width=24)
-    line_height = 54
-    total_text_h = len(lines) * line_height
-    start_y = h - total_text_h - 160
-
-    # Semi-transparent dark pill behind text for high readability
-    draw.rounded_rectangle(
-        [40, start_y - 20, w - 40, start_y + total_text_h + 20],
-        radius=24,
-        fill=(0, 0, 0, 175)
-    )
-
-    for i, line in enumerate(lines):
-        bbox = draw.textbbox((0, 0), line, font=font)
-        text_w = bbox[2] - bbox[0]
-        x = (w - text_w) // 2
-        y = start_y + i * line_height
-        # Black outline + bright yellow/white text
-        for dx, dy in [(-2, -2), (2, -2), (-2, 2), (2, 2)]:
-            draw.text((x + dx, y + dy), line, font=font, fill=(0, 0, 0, 255))
-        draw.text((x, y), line, font=font, fill=(255, 230, 50, 255))
-
-    return img
-
-def generate_animated_frame(visual_prompt, caption, out_path, idx):
-    full_prompt = f"{visual_prompt}, {ANIMATION_STYLE}"
+def generate_animated_frame(character_sheet, scene_action, out_path, idx):
+    full_prompt = f"{scene_action}, featuring {character_sheet}, {STYLE_SUFFIX}"
     encoded = requests.utils.quote(full_prompt)
-    urls = [
-        f"https://image.pollinations.ai/prompt/{encoded}?width=720&height=1360&model=flux&nologo=true&enhance=true&seed={777 + idx * 13}",
-        f"https://image.pollinations.ai/prompt/{encoded}?width=720&height=1360&nologo=true&seed={888 + idx * 13}"
+
+    endpoints = [
+        f"https://image.pollinations.ai/prompt/{encoded}?width=720&height=1360&model=flux&nologo=true&enhance=true&seed={500 + idx * 19}",
+        f"https://image.pollinations.ai/prompt/{encoded}?width=720&height=1360&model=turbo&nologo=true&seed={600 + idx * 19}",
+        f"https://image.pollinations.ai/prompt/{encoded}?width=720&height=1360&nologo=true&seed={700 + idx * 19}",
     ]
 
-    img = None
-    for url in urls:
-        for _ in range(3):
-            try:
-                res = requests.get(url, timeout=60)
-                if res.status_code == 200 and len(res.content) > 25000:
-                    candidate = Image.open(io.BytesIO(res.content)).convert("RGB")
-                    # Verify image is not blank white or pure black
-                    mean_brightness = sum(ImageStat.Stat(candidate).mean) / 3
-                    if 15 < mean_brightness < 245:
-                        w, h = candidate.size
-                        img = candidate.crop((0, 0, w, int(h * 0.93))).resize((720, 1280), Image.Resampling.LANCZOS)
-                        time.sleep(4)
-                        break
-            except Exception:
-                pass
-            time.sleep(5)
-        if img is not None:
-            break
+    # Patiently retry up to 9 times across endpoints so zero blank frames ever happen
+    for attempt in range(9):
+        url = endpoints[attempt % len(endpoints)]
+        try:
+            res = requests.get(url, timeout=90)
+            if res.status_code == 200 and len(res.content) > 30000:
+                candidate = Image.open(io.BytesIO(res.content)).convert("RGB")
+                if is_valid_artwork(candidate):
+                    w, h = candidate.size
+                    # Crop bottom 7% to remove any watermark cleanly
+                    img = candidate.crop((0, 0, w, int(h * 0.93))).resize((720, 1280), Image.Resampling.LANCZOS)
+                    img.save(out_path, "JPEG", quality=95)
+                    print(f"Scene {idx+1} rendered cleanly on attempt {attempt+1}")
+                    time.sleep(8)  # Cooldown to avoid rate limits on next scene
+                    return
+        except Exception as e:
+            print(f"Scene {idx+1} attempt {attempt+1} retrying: {e}")
+        time.sleep(10)
 
-    if img is None:
-        img = Image.new("RGB", (720, 1280), color=(24, 32, 56))
-
-    img = add_bold_subtitle(img, caption)
-    img.save(out_path, "JPEG", quality=95)
+    raise Exception(f"Failed to generate valid 3D animation frame for scene {idx+1} after 9 attempts.")
 
 async def main():
     audio_file = download_audio(VIDEO_URL)
     transcript = transcribe_audio(audio_file)
-    scenes = rewrite_script(transcript)
+    story_data = rewrite_script(transcript)
+    character_sheet = story_data.get("character_sheet", "")
+    scenes = story_data["scenes"]
 
     clips = []
     for idx, scene in enumerate(scenes):
         v_path = f"temp/v_{idx}.mp3"
         i_path = f"temp/i_{idx}.jpg"
         await generate_voice(scene["voice_hindi"], v_path)
-        generate_animated_frame(scene["visual_prompt"], scene["caption_hinglish"], i_path, idx)
+        generate_animated_frame(character_sheet, scene["scene_action"], i_path, idx)
 
         a_clip = AudioFileClip(v_path)
         dur = max(a_clip.duration, 1.5)
 
-        # Dynamic cinematic motion (alternating zoom-in & zoom-out so every scene feels alive)
+        # Smooth alternating camera motion (zoom-in / zoom-out)
         if idx % 2 == 0:
             i_clip = (
                 ImageClip(i_path)
@@ -205,7 +177,7 @@ async def main():
     with open(out_file, "rb") as video:
         requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo",
-            data={"chat_id": CHAT_ID, "caption": "✅ 3D Animated Story Reel + Bold Captions Ready!"},
+            data={"chat_id": CHAT_ID, "caption": "✅ Clean 3D Animated Story Reel Ready (No Captions, Zero Blank Frames)!"},
             files={"video": video}
         )
 
