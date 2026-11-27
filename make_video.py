@@ -6,11 +6,11 @@ import yt_dlp
 import edge_tts
 from moviepy import ImageClip, AudioFileClip, concatenate_videoclips
 
-GROQ_API_KEY = os.environ["GROQ_API_KEY"]
-GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
-BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
-VIDEO_URL = os.environ["VIDEO_URL"]
+GROQ_API_KEY = os.environ["GROQ_API_KEY"].strip()
+GEMINI_API_KEY = os.environ["GEMINI_API_KEY"].strip()
+BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"].strip()
+CHAT_ID = os.environ["TELEGRAM_CHAT_ID"].strip()
+VIDEO_URL = os.environ["VIDEO_URL"].strip()
 
 os.makedirs("temp", exist_ok=True)
 CHARACTER_STYLE = "3D Pixar animation style, friendly Indian young man wearing a navy blue hoodie, expressive face, vibrant studio lighting, 9:16 vertical aspect ratio, high detail"
@@ -32,18 +32,24 @@ def transcribe_audio(audio_path):
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
     with open(audio_path, "rb") as f:
         res = requests.post(url, headers=headers, files={"file": ("audio.mp3", f, "audio/mpeg")}, data={"model": "whisper-large-v3"})
-    return res.json().get("text", "")
+    data = res.json()
+    if "text" not in data:
+        raise Exception(f"Groq Error: {data}")
+    return data["text"]
 
 def rewrite_script(transcript):
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
     prompt = f"""
     Rewrite this transcript into a 35-second viral Hinglish faceless video script with 4 scenes.
     Return ONLY valid JSON: {{"scenes": [{{"narration": "...", "visual_action": "..."}}]}}
     Transcript: {transcript}
     """
-    res = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}).json()
-    raw = res["candidates"][0]["content"]["parts"][0]["text"].replace("```json", "").replace("```", "").strip()
-    return json.loads(raw)["scenes"]
+    for model in ["gemini-2.5-flash", "gemini-2.0-flash"]:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+        res = requests.post(url, json={"contents": [{"parts": [{"text": prompt}]}]}).json()
+        if "candidates" in res:
+            raw = res["candidates"][0]["content"]["parts"][0]["text"].replace("```json", "").replace("```", "").strip()
+            return json.loads(raw)["scenes"]
+    raise Exception(f"Gemini API Error: {res}")
 
 async def generate_voice(text, path):
     await edge_tts.Communicate(text, "hi-IN-MadhurNeural", rate="+10%").save(path)
