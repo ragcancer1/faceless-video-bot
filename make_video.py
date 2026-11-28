@@ -171,4 +171,56 @@ def render_scene_visual(visual_prompt, fallback_kw, out_mp4, target_dur, idx):
                 USED_VIDEO_IDS.add(chosen["id"])
                 vid_url = chosen.get("videos", {}).get("medium", {}).get("url")
                 if vid_url:
-                    raw_p = f"temp/pb_{idx}.MP4" 
+                    raw_p = f"temp/pb_{idx}.mp4"
+                    with open(raw_p, "wb") as f:
+                        f.write(requests.get(vid_url, timeout=40).content)
+                    clip = VideoFileClip(raw_p).without_audio()
+                    scale = max(720 / clip.w, 1280 / clip.h)
+                    clip = clip.resized(scale)
+                    clip = clip.cropped(x1=(clip.w - 720) / 2, y1=(clip.h - 1280) / 2, width=720, height=1280)
+                    if clip.duration >= target_dur:
+                        clip = clip.subclipped(0, target_dur)
+                    else:
+                        clip = concatenate_videoclips([clip] * math.ceil(target_dur / max(clip.duration, 0.5))).subclipped(0, target_dur)
+                    clip.write_videofile(out_mp4, fps=30, codec="libx264", audio=False, logger=None)
+                    print(f"Scene {idx+1}: Backup HD clip used!")
+                    return
+        except Exception:
+            pass
+
+    raise Exception(f"Failed to render Scene {idx+1}")
+
+async def main():
+    audio_file, orig_duration = download_audio_and_get_duration(VIDEO_URL)
+    print(f"Original video duration: {orig_duration:.2f}s")
+    transcript = transcribe_audio(audio_file)
+    scenes = rewrite_script(transcript, orig_duration)
+
+    clips = []
+    for idx, scene in enumerate(scenes):
+        v_path = f"temp/v_{idx}.mp3"
+        clip_path = f"temp/scene_{idx}.mp4"
+        await generate_voice(scene["voice_hindi"], v_path)
+        a_clip = AudioFileClip(v_path)
+        dur = max(a_clip.duration, 1.5)
+
+        render_scene_visual(scene["visual_prompt"], scene.get("fallback_keyword", "cosmic light"), clip_path, dur, idx)
+        v_clip = VideoFileClip(clip_path).with_duration(dur).with_audio(a_clip)
+        clips.append(v_clip)
+
+    final = concatenate_videoclips(clips, method="compose")
+    out_file = "final_reel.mp4"
+    final.write_videofile(out_file, fps=30, codec="libx264", audio_codec="aac", bitrate="3500k", logger=None)
+
+    with open(out_file, "rb") as video:
+        requests.post(
+            f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo",
+            data={
+                "chat_id": CHAT_ID,
+                "caption": f"✅ 3D Animated Reel Ready ({round(final.duration)}s — Matched to Original {round(orig_duration)}s)!"
+            },
+            files={"video": video}
+        )
+
+if __name__ == "__main__":
+    asyncio.run(main())
