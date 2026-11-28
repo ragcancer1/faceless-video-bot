@@ -171,4 +171,4 @@ def render_scene_visual(visual_prompt, fallback_kw, out_mp4, target_dur, idx):
                 USED_VIDEO_IDS.add(chosen["id"])
                 vid_url = chosen.get("videos", {}).get("medium", {}).get("url")
                 if vid_url:
-                    raw_p = f"temp/pb_{idx}.
+                    raw_p = f"temp/pb_{idx}.MP4" 
