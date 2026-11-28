@@ -37,7 +37,10 @@ def transcribe_audio(audio_path):
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
     with open(audio_path, "rb") as f:
         res = requests.post(url, headers=headers, files={"file": ("audio.mp3", f, "audio/mpeg")}, data={"model": "whisper-large-v3"})
-    return res.json()["text"]
+    data = res.json()
+    if "text" not in data:
+        raise Exception(f"Groq Whisper Error: {data}")
+    return data["text"]
 
 def rewrite_script(transcript, target_duration):
     num_scenes = max(4, min(8, round(target_duration / 5.0)))
@@ -56,25 +59,40 @@ def rewrite_script(transcript, target_duration):
 
     Transcript: {transcript}
     """
-    for model in ["gemini-2.5-flash", "gemini-2.5-flash-lite"]:
+    gemini_res = {}
+    for model in ["gemini-2.5-flash", "gemini-2.5-flash-lite", "gemini-2.0-flash"]:
         g_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
-        res = requests.post(g_url, json={"contents": [{"parts": [{"text": prompt}]}]}).json()
-        if "candidates" in res:
-            raw = res["candidates"][0]["content"]["parts"][0]["text"].replace("```json", "").replace("```", "").strip()
-            return json.loads(raw)
-        time.sleep(2)
+        for _ in range(2):
+            gemini_res = requests.post(g_url, json={"contents": [{"parts": [{"text": prompt}]}]}).json()
+            if "candidates" in gemini_res:
+                raw = gemini_res["candidates"][0]["content"]["parts"][0]["text"].replace("```json", "").replace("```", "").strip()
+                return json.loads(raw)
+            time.sleep(3)
 
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-    groq_res = requests.post(
-        "https://api.groq.com/openai/v1/chat/completions",
-        headers=headers,
-        json={
-            "model": "llama-3.3-70b-versatile",
-            "messages": [{"role": "user", "content": prompt}],
-            "response_format": {"type": "json_object"}
-        }
-    ).json()
-    return json.loads(groq_res["choices"][0]["message"]["content"])
+    models_data = requests.get("https://api.groq.com/openai/v1/models", headers=headers).json()
+    available_models = [
+        m["id"] for m in models_data.get("data", [])
+        if any(k in m["id"].lower() for k in ["llama", "qwen", "gemma", "deepseek"])
+        and "whisper" not in m["id"].lower() and "guard" not in m["id"].lower()
+    ]
+
+    groq_res = {}
+    for g_model in available_models:
+        groq_res = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers=headers,
+            json={
+                "model": g_model,
+                "messages": [{"role": "user", "content": prompt}],
+                "response_format": {"type": "json_object"}
+            }
+        ).json()
+        if "choices" in groq_res:
+            raw = groq_res["choices"][0]["message"]["content"].strip()
+            return json.loads(raw)
+
+    raise Exception(f"Both APIs failed. Gemini: {gemini_res} | Groq: {groq_res}")
 
 async def generate_voice(text, path):
     clean_text = text.strip() or "कहानी आगे बढ़ती है।"
