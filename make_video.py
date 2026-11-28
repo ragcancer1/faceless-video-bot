@@ -1,29 +1,23 @@
 import os
 import io
 import json
-import math
+import base64
 import time
-import random
 import asyncio
+import subprocess
 import requests
 import yt_dlp
 import edge_tts
 from gtts import gTTS
-from PIL import Image, ImageDraw, ImageStat
-from moviepy import VideoFileClip, ImageClip, AudioFileClip, concatenate_videoclips
+from PIL import Image, ImageStat
 
 GROQ_API_KEY = os.environ["GROQ_API_KEY"].strip()
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"].strip()
-PIXABAY_API_KEY = os.environ.get("PIXABAY_API_KEY", "").strip()
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"].strip()
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"].strip()
 VIDEO_URL = os.environ["VIDEO_URL"].strip()
 
 os.makedirs("temp", exist_ok=True)
-USED_VIDEO_IDS = set()
-
-STYLE_SUFFIX = "3D Pixar Disney animation style, vibrant cinematic lighting, 9:16 vertical, 8k, no text, no watermark"
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
 def download_audio_and_get_duration(url):
     audio_path = "temp/input_audio.mp3"
@@ -36,217 +30,183 @@ def download_audio_and_get_duration(url):
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         duration = float(info.get("duration") or 30.0)
-    duration = max(12.0, min(60.0, duration))
-    return audio_path, duration
+    return audio_path, max(12.0, min(60.0, duration))
 
 def transcribe_audio(audio_path):
     url = "https://api.groq.com/openai/v1/audio/transcriptions"
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
     with open(audio_path, "rb") as f:
         res = requests.post(url, headers=headers, files={"file": ("audio.mp3", f, "audio/mpeg")}, data={"model": "whisper-large-v3"})
-    data = res.json()
-    if "text" not in data:
-        raise Exception(f"Groq Error: {data}")
-    return data["text"]
+    return res.json()["text"]
 
 def rewrite_script(transcript, target_duration):
-    num_scenes = max(4, min(9, round(target_duration / 4.8)))
-    words_per_scene = max(7, round((target_duration * 2.3) / num_scenes))
+    num_scenes = max(4, min(8, round(target_duration / 5.0)))
+    words_per_scene = max(8, round((target_duration * 2.2) / num_scenes))
 
     prompt = f"""
-    Rewrite this transcript into an engaging viral Hindi animated story reel of EXACTLY {round(target_duration)} seconds divided into {num_scenes} scenes.
-    
-    CRITICAL RULES:
-    1. 'voice_hindi': Pure natural Devanagari Hindi script with Hindi words for ALL numbers (e.g., "दस अवतार", "बीस साल", "सात हज़ार"). Keep each scene around {words_per_scene} Hindi words so total narration matches ~{round(target_duration)} seconds.
-    2. 'visual_prompt': Short, vivid English prompt (MAX 18 words) describing the 3D animated scene, character, action, and background.
-    3. 'fallback_keyword': 2 simple English words for stock video backup (e.g., "ocean waves", "ancient temple", "golden light").
+    Rewrite this viral story transcript into a {round(target_duration)}-second Hindi 3D animated reel with {num_scenes} scenes.
+
+    STRICT RULES:
+    1. 'character_bible': Define ONE consistent 3D Pixar-style main character and setting in English.
+    2. 'voice_hindi': Pure Devanagari Hindi narration matching the story's emotion. Write ALL numbers in Hindi words (e.g., "दस", "बीस साल"). Keep each scene ~{words_per_scene} Hindi words.
+    3. 'visual_prompt': Specific scene action (MAX 22 words) using the EXACT same character from 'character_bible'.
 
     Return ONLY valid JSON:
-    {{"scenes": [{{"voice_hindi": "...", "visual_prompt": "...", "fallback_keyword": "..."}}]}}
-    
+    {{"character_bible": "...", "scenes": [{{"voice_hindi": "...", "visual_prompt": "..."}}]}}
+
     Transcript: {transcript}
     """
-    gemini_res = {}
-    for model in ["gemini-3.8-flash", "gemini-2.5-flash-lite"]:
-        gemini_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
-        for _ in range(2):
-            gemini_res = requests.post(gemini_url, json={"contents": [{"parts": [{"text": prompt}]}]}).json()
-            if "candidates" in gemini_res:
-                raw = gemini_res["candidates"][0]["content"]["parts"][0]["text"].replace("```json", "").replace("```", "").strip()
-                return json.loads(raw)["scenes"]
-            time.sleep(3)
+    for model in ["gemini-2.5-flash", "gemini-2.5-flash-lite"]:
+        g_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+        res = requests.post(g_url, json={"contents": [{"parts": [{"text": prompt}]}]}).json()
+        if "candidates" in res:
+            raw = res["candidates"][0]["content"]["parts"][0]["text"].replace("```json", "").replace("```", "").strip()
+            return json.loads(raw)
+        time.sleep(2)
 
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}"}
-    models_data = requests.get("https://api.groq.com/openai/v1/models", headers=headers).json()
-    available_models = [
-        m["id"] for m in models_data.get("data", [])
-        if any(k in m["id"].lower() for k in ["llama", "qwen", "gemma", "deepseek"])
-        and "whisper" not in m["id"].lower() and "guard" not in m["id"].lower()
-    ]
-    
-    groq_res = {}
-    for g_model in available_models:
-        groq_res = requests.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers=headers,
-            json={
-                "model": g_model,
-                "messages": [{"role": "user", "content": prompt}],
-                "response_format": {"type": "json_object"}
-            }
-        ).json()
-        if "choices" in groq_res:
-            raw = groq_res["choices"][0]["message"]["content"].strip()
-            return json.loads(raw)["scenes"]
-
-    raise Exception(f"Both APIs failed. Gemini: {gemini_res} | Groq: {groq_res}")
+    groq_res = requests.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers=headers,
+        json={
+            "model": "llama-3.3-70b-versatile",
+            "messages": [{"role": "user", "content": prompt}],
+            "response_format": {"type": "json_object"}
+        }
+    ).json()
+    return json.loads(groq_res["choices"][0]["message"]["content"])
 
 async def generate_voice(text, path):
     clean_text = text.strip() or "कहानी आगे बढ़ती है।"
     for voice in ["hi-IN-MadhurNeural", "hi-IN-SwaraNeural"]:
-        for attempt in range(3):
+        for _ in range(3):
             try:
-                await edge_tts.Communicate(clean_text, voice, rate="+6%").save(path)
+                await edge_tts.Communicate(clean_text, voice, rate="+5%").save(path)
                 if os.path.exists(path) and os.path.getsize(path) > 1000:
-                    await asyncio.sleep(1)
                     return
             except Exception:
-                await asyncio.sleep(2)
+                await asyncio.sleep(1.5)
     gTTS(text=clean_text, lang="hi", slow=False).save(path)
 
-def is_valid_artwork(img):
+def get_audio_duration(audio_path):
+    cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=noprint_wrappers=1:nokey=1", audio_path]
+    return max(1.5, float(subprocess.check_output(cmd).decode().strip()))
+
+def is_clean_image(img):
     stat = ImageStat.Stat(img)
-    mean_brightness = sum(stat.mean) / 3
-    std_dev = sum(stat.stddev) / 3
-    return (20 < mean_brightness < 240) and (std_dev > 18)
+    return (20 < sum(stat.mean) / 3 < 240) and (sum(stat.stddev) / 3 > 20)
 
-def create_motion_clip_from_image(img_path, target_dur, idx):
-    base = ImageClip(img_path).with_duration(target_dur)
-    if idx % 3 == 0:
-        return base.resized(lambda t, d=target_dur: 1.0 + 0.10 * (t / d)).with_position(('center', 'center'))
-    elif idx % 3 == 1:
-        return base.resized(lambda t, d=target_dur: 1.10 - 0.10 * (t / d)).with_position(('center', 'center'))
-    else:
-        return base.resized(1.12).with_position(lambda t, d=target_dur: (int(-35 * (t / d)), 'center'))
+def generate_consistent_3d_image(character_bible, visual_prompt, out_jpg, idx):
+    full_prompt = (
+        f"3D Pixar Disney animated movie still, {visual_prompt}, featuring {character_bible}. "
+        f"Warm cinematic studio lighting, rich 3D textures, vertical 9:16 framing, no text, no watermark."
+    )
 
-def fetch_ai_image(short_prompt, idx):
-    encoded = requests.utils.quote(short_prompt)
-    # Try multiple distinct free AI image endpoints & models
-    urls = [
-        f"https://image.pollinations.ai/prompt/{encoded}?width=720&height=1360&model=flux&nologo=true&seed={random.randint(1000,99999)}",
-        f"https://image.pollinations.ai/prompt/{encoded}?width=720&height=1360&model=turbo&nologo=true&seed={random.randint(1000,99999)}",
-        f"https://pollinations.ai/p/{encoded}?width=720&height=1360&nologo=true&seed={random.randint(1000,99999)}"
-    ]
-    for url in urls:
-        try:
-            res = requests.get(url, headers=HEADERS, timeout=45)
-            if res.status_code == 200 and len(res.content) > 25000:
-                candidate = Image.open(io.BytesIO(res.content)).convert("RGB")
-                if is_valid_artwork(candidate):
-                    w, h = candidate.size
-                    return candidate.crop((0, 0, w, int(h * 0.93))).resize((720, 1280), Image.Resampling.LANCZOS)
-        except Exception:
-            pass
-        time.sleep(3)
-
-    # Try Hercai free AI image API as second independent provider
+    # 1. Google Imagen 3
+    imagen_url = f"https://generativelanguage.googleapis.com/v1beta/models/imagen-3.0-generate-002:predict?key={GEMINI_API_KEY}"
     try:
-        h_res = requests.get(f"https://hercai.onrender.com/v3/text2image?prompt={encoded}", headers=HEADERS, timeout=45).json()
-        img_url = h_res.get("url")
-        if img_url:
-            img_data = requests.get(img_url, headers=HEADERS, timeout=30).content
-            candidate = Image.open(io.BytesIO(img_data)).convert("RGB")
-            if is_valid_artwork(candidate):
-                return candidate.resize((720, 1280), Image.Resampling.LANCZOS)
+        res = requests.post(
+            imagen_url,
+            json={"instances": [{"prompt": full_prompt}], "parameters": {"sampleCount": 1, "aspectRatio": "9:16"}},
+            timeout=60
+        ).json()
+        preds = res.get("predictions", [])
+        if preds and "bytesBase64Encoded" in preds[0]:
+            img = Image.open(io.BytesIO(base64.b64decode(preds[0]["bytesBase64Encoded"]))).convert("RGB").resize((720, 1280), Image.Resampling.LANCZOS)
+            img.save(out_jpg, "JPEG", quality=95)
+            return
     except Exception:
         pass
 
-    return None
-
-def render_scene_visual(visual_prompt, fallback_kw, out_mp4, target_dur, idx):
-    short_prompt = f"{visual_prompt[:150]}, {STYLE_SUFFIX}"
-    img = fetch_ai_image(short_prompt, idx)
-
-    if img is not None:
-        img_path = f"temp/i_{idx}.jpg"
-        img.save(img_path, "JPEG", quality=95)
-        ic = create_motion_clip_from_image(img_path, target_dur, idx)
-        ic.write_videofile(out_mp4, fps=30, codec="libx264", audio=False, logger=None)
-        print(f"Scene {idx+1}: 3D AI frame rendered!")
-        time.sleep(4)
-        return
-
-    # Backup 1: Pixabay HD Stock Video matching scene topic
-    if PIXABAY_API_KEY:
-        for q in [fallback_kw, fallback_kw.split()[0] if fallback_kw else "nature", "cosmic stars"]:
-            try:
-                res = requests.get(
-                    "https://pixabay.com/api/videos/",
-                    params={"key": PIXABAY_API_KEY, "q": q, "per_page": 8},
-                    timeout=20
-                ).json()
-                hits = [v for v in res.get("hits", []) if v["id"] not in USED_VIDEO_IDS] or res.get("hits", [])
-                if hits:
-                    chosen = random.choice(hits[:5])
-                    USED_VIDEO_IDS.add(chosen["id"])
-                    vid_url = chosen.get("videos", {}).get("medium", {}).get("url") or chosen.get("videos", {}).get("small", {}).get("url")
-                    if vid_url:
-                        raw_p = f"temp/pb_{idx}.mp4"
-                        with open(raw_p, "wb") as f:
-                            f.write(requests.get(vid_url, timeout=40).content)
-                        clip = VideoFileClip(raw_p).without_audio()
-                        scale = max(720 / clip.w, 1280 / clip.h)
-                        clip = clip.resized(scale)
-                        clip = clip.cropped(x1=(clip.w - 720) / 2, y1=(clip.h - 1280) / 2, width=720, height=1280)
-                        if clip.duration >= target_dur:
-                            clip = clip.subclipped(0, target_dur)
-                        else:
-                            clip = concatenate_videoclips([clip] * math.ceil(target_dur / max(clip.duration, 0.5))).subclipped(0, target_dur)
-                        clip.write_videofile(out_mp4, fps=30, codec="libx264", audio=False, logger=None)
-                        print(f"Scene {idx+1}: Pixabay HD video clip rendered!")
+    # 2. Gemini Native Image Generation
+    for g_img_model in ["gemini-2.5-flash-image", "gemini-2.0-flash-exp-image-generation"]:
+        g_url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_img_model}:generateContent?key={GEMINI_API_KEY}"
+        try:
+            res = requests.post(
+                g_url,
+                json={"contents": [{"parts": [{"text": f"Generate a vertical 9:16 image: {full_prompt}"}]}]},
+                timeout=60
+            ).json()
+            for cand in res.get("candidates", []):
+                for part in cand.get("content", {}).get("parts", []):
+                    if "inlineData" in part:
+                        img = Image.open(io.BytesIO(base64.b64decode(part["inlineData"]["data"]))).convert("RGB").resize((720, 1280), Image.Resampling.LANCZOS)
+                        img.save(out_jpg, "JPEG", quality=95)
                         return
-            except Exception:
-                pass
+        except Exception:
+            pass
 
-    # Backup 2: Cinematic Styled Gradient Card (never crashes workflow)
-    fb_img = Image.new("RGB", (720, 1280), color=(28, 36, 64))
-    draw = ImageDraw.Draw(fb_img)
-    for y in range(1280):
-        draw.line([(0, y), (720, y)], fill=(20 + int(30 * y / 1280), 28 + int(45 * y / 1280), 60 + int(80 * y / 1280)))
-    fb_path = f"temp/fb_{idx}.jpg"
-    fb_img.save(fb_path, "JPEG", quality=90)
-    ic = create_motion_clip_from_image(fb_path, target_dur, idx)
-    ic.write_videofile(out_mp4, fps=30, codec="libx264", audio=False, logger=None)
-    print(f"Scene {idx+1}: Gradient fallback rendered!")
+    # 3. Clean Pollinations Flux Backup
+    encoded = requests.utils.quote(full_prompt[:220])
+    for attempt in range(5):
+        url = f"https://image.pollinations.ai/prompt/{encoded}?width=720&height=1360&model=flux&nologo=true&seed={900 + idx * 31 + attempt}"
+        try:
+            res = requests.get(url, timeout=60)
+            if res.status_code == 200 and len(res.content) > 35000:
+                cand = Image.open(io.BytesIO(res.content)).convert("RGB")
+                if is_clean_image(cand):
+                    w, h = cand.size
+                    cand.crop((0, 0, w, int(h * 0.93))).resize((720, 1280), Image.Resampling.LANCZOS).save(out_jpg, "JPEG", quality=95)
+                    time.sleep(5)
+                    return
+        except Exception:
+            pass
+        time.sleep(6)
+
+    raise Exception(f"Failed to generate clean 3D frame for Scene {idx+1}")
+
+def render_scene_with_ffmpeg(img_path, audio_path, out_mp4, dur, idx):
+    frames = int(dur * 30)
+    if idx % 2 == 0:
+        zp = f"zoompan=z='min(zoom+0.0012,1.12)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s=720x1280:fps=30"
+    else:
+        zp = f"zoompan=z='if(lte(zoom,1.0),1.12,max(1.001,zoom-0.0012))':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s=720x1280:fps=30"
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-loop", "1", "-i", img_path,
+        "-i", audio_path,
+        "-vf", f"scale=1440:2560,{zp},format=yuv420p",
+        "-c:v", "libx264", "-preset", "medium", "-crf", "20",
+        "-c:a", "aac", "-b:a", "192k",
+        "-t", f"{dur:.3f}",
+        out_mp4
+    ]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 async def main():
     audio_file, orig_duration = download_audio_and_get_duration(VIDEO_URL)
-    print(f"Original video duration: {orig_duration:.2f}s")
     transcript = transcribe_audio(audio_file)
-    scenes = rewrite_script(transcript, orig_duration)
+    story = rewrite_script(transcript, orig_duration)
+    character_bible = story.get("character_bible", "")
+    scenes = story["scenes"]
 
-    clips = []
-    for idx, scene in enumerate(scenes):
-        v_path = f"temp/v_{idx}.mp3"
-        clip_path = f"temp/scene_{idx}.mp4"
-        await generate_voice(scene["voice_hindi"], v_path)
-        a_clip = AudioFileClip(v_path)
-        dur = max(a_clip.duration, 1.5)
+    concat_list_path = "temp/concat.txt"
+    with open(concat_list_path, "w") as cl:
+        for idx, scene in enumerate(scenes):
+            v_path = f"temp/v_{idx}.mp3"
+            img_path = f"temp/img_{idx}.jpg"
+            scene_mp4 = f"temp/scene_{idx}.mp4"
 
-        render_scene_visual(scene["visual_prompt"], scene.get("fallback_keyword", "cosmic light"), clip_path, dur, idx)
-        v_clip = VideoFileClip(clip_path).with_duration(dur).with_audio(a_clip)
-        clips.append(v_clip)
+            await generate_voice(scene["voice_hindi"], v_path)
+            dur = get_audio_duration(v_path)
+            generate_consistent_3d_image(character_bible, scene["visual_prompt"], img_path, idx)
+            render_scene_with_ffmpeg(img_path, v_path, scene_mp4, dur, idx)
+            cl.write(f"file 'scene_{idx}.mp4'\n")
 
-    final = concatenate_videoclips(clips, method="compose")
     out_file = "final_reel.mp4"
-    final.write_videofile(out_file, fps=30, codec="libx264", audio_codec="aac", bitrate="3500k", logger=None)
+    subprocess.run(
+        ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_list_path, "-c", "copy", out_file],
+        check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
 
+    final_dur = get_audio_duration(out_file)
     with open(out_file, "rb") as video:
         requests.post(
             f"https://api.telegram.org/bot{BOT_TOKEN}/sendVideo",
             data={
                 "chat_id": CHAT_ID,
-                "caption": f"✅ 3D Animated Reel Ready ({round(final.duration)}s — Matched to Original {round(orig_duration)}s)!"
+                "caption": f"✅ Clean 3D Pixar Story Reel ({round(final_dur)}s — Original {round(orig_duration)}s)"
             },
             files={"video": video}
         )
