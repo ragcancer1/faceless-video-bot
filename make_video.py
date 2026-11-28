@@ -1,18 +1,19 @@
 import os
 import io
 import json
-import base64
 import time
+import random
 import asyncio
 import subprocess
 import requests
 import yt_dlp
 import edge_tts
 from gtts import gTTS
-from PIL import Image, ImageStat
+from PIL import Image, ImageDraw, ImageStat
 
 GROQ_API_KEY = os.environ["GROQ_API_KEY"].strip()
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"].strip()
+HF_TOKEN = os.environ.get("HF_TOKEN", "").strip()
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"].strip()
 CHAT_ID = os.environ["TELEGRAM_CHAT_ID"].strip()
 VIDEO_URL = os.environ["VIDEO_URL"].strip()
@@ -43,16 +44,16 @@ def transcribe_audio(audio_path):
     return data["text"]
 
 def rewrite_script(transcript, target_duration):
-    num_scenes = max(4, min(8, round(target_duration / 5.0)))
+    num_scenes = max(4, min(7, round(target_duration / 5.5)))
     words_per_scene = max(8, round((target_duration * 2.2) / num_scenes))
 
     prompt = f"""
     Rewrite this viral story transcript into a {round(target_duration)}-second Hindi 3D animated reel with {num_scenes} scenes.
 
     STRICT RULES:
-    1. 'character_bible': Define ONE consistent 3D Pixar-style main character and setting in English.
+    1. 'character_bible': Define ONE consistent 3D Pixar-style main character and setting in English (MAX 15 words).
     2. 'voice_hindi': Pure Devanagari Hindi narration matching the story's emotion. Write ALL numbers in Hindi words (e.g., "दस", "बीस साल"). Keep each scene ~{words_per_scene} Hindi words.
-    3. 'visual_prompt': Specific scene action (MAX 22 words) using the EXACT same character from 'character_bible'.
+    3. 'visual_prompt': Specific scene action (MAX 18 words) using the EXACT same character from 'character_bible'.
 
     Return ONLY valid JSON:
     {{"character_bible": "...", "scenes": [{{"voice_hindi": "...", "visual_prompt": "..."}}]}}
@@ -116,62 +117,60 @@ def is_clean_image(img):
 
 def generate_consistent_3d_image(character_bible, visual_prompt, out_jpg, idx):
     full_prompt = (
-        f"3D Pixar Disney animated movie still, {visual_prompt}, featuring {character_bible}. "
-        f"Warm cinematic studio lighting, rich 3D textures, vertical 9:16 framing, no text, no watermark."
+        f"3D Pixar Disney animated movie scene, {visual_prompt}, featuring {character_bible}, "
+        f"warm cinematic lighting, vertical 9:16 framing, no text, no watermark"
     )
 
-    # 1. Google Imagen 3
-    imagen_url = f"https://generativelanguage.googleapis.com/v1beta/models/imagen-3.0-generate-002:predict?key={GEMINI_API_KEY}"
-    try:
-        res = requests.post(
-            imagen_url,
-            json={"instances": [{"prompt": full_prompt}], "parameters": {"sampleCount": 1, "aspectRatio": "9:16"}},
-            timeout=60
-        ).json()
-        preds = res.get("predictions", [])
-        if preds and "bytesBase64Encoded" in preds[0]:
-            img = Image.open(io.BytesIO(base64.b64decode(preds[0]["bytesBase64Encoded"]))).convert("RGB").resize((720, 1280), Image.Resampling.LANCZOS)
-            img.save(out_jpg, "JPEG", quality=95)
-            return
-    except Exception:
-        pass
-
-    # 2. Gemini Native Image Generation
-    for g_img_model in ["gemini-2.5-flash-image", "gemini-2.0-flash-exp-image-generation"]:
-        g_url = f"https://generativelanguage.googleapis.com/v1beta/models/{g_img_model}:generateContent?key={GEMINI_API_KEY}"
-        try:
-            res = requests.post(
-                g_url,
-                json={"contents": [{"parts": [{"text": f"Generate a vertical 9:16 image: {full_prompt}"}]}]},
-                timeout=60
-            ).json()
-            for cand in res.get("candidates", []):
-                for part in cand.get("content", {}).get("parts", []):
-                    if "inlineData" in part:
-                        img = Image.open(io.BytesIO(base64.b64decode(part["inlineData"]["data"]))).convert("RGB").resize((720, 1280), Image.Resampling.LANCZOS)
-                        img.save(out_jpg, "JPEG", quality=95)
+    # 1. Hugging Face Free Inference API (Primary — Fast & Consistent if HF_TOKEN is set)
+    if HF_TOKEN:
+        hf_models = [
+            "black-forest-labs/FLUX.1-schnell",
+            "stabilityai/stable-diffusion-xl-base-1.0"
+        ]
+        hf_headers = {"Authorization": f"Bearer {HF_TOKEN}"}
+        for hf_m in hf_models:
+            try:
+                res = requests.post(
+                    f"https://router.huggingface.co/hf-inference/models/{hf_m}",
+                    headers=hf_headers,
+                    json={"inputs": full_prompt, "parameters": {"width": 720, "height": 1280}},
+                    timeout=60
+                )
+                if res.status_code == 200 and len(res.content) > 25000:
+                    cand = Image.open(io.BytesIO(res.content)).convert("RGB")
+                    if is_clean_image(cand):
+                        cand.resize((720, 1280), Image.Resampling.LANCZOS).save(out_jpg, "JPEG", quality=95)
+                        print(f"Scene {idx+1}: HuggingFace {hf_m} rendered!")
                         return
-        except Exception:
-            pass
+            except Exception as e:
+                print(f"HF {hf_m} skipped: {e}")
 
-    # 3. Clean Pollinations Flux Backup
-    encoded = requests.utils.quote(full_prompt[:220])
-    for attempt in range(5):
-        url = f"https://image.pollinations.ai/prompt/{encoded}?width=720&height=1360&model=flux&nologo=true&seed={900 + idx * 31 + attempt}"
+    # 2. Pollinations with 15s Cooldown (Respects free rate limit so Scene 2+ never block)
+    encoded = requests.utils.quote(full_prompt[:200])
+    for attempt in range(6):
+        model_name = "flux" if attempt % 2 == 0 else "turbo"
+        url = f"https://image.pollinations.ai/prompt/{encoded}?width=720&height=1360&model={model_name}&nologo=true&seed={random.randint(1000, 99999)}"
         try:
             res = requests.get(url, timeout=60)
-            if res.status_code == 200 and len(res.content) > 35000:
+            if res.status_code == 200 and len(res.content) > 30000:
                 cand = Image.open(io.BytesIO(res.content)).convert("RGB")
                 if is_clean_image(cand):
                     w, h = cand.size
                     cand.crop((0, 0, w, int(h * 0.93))).resize((720, 1280), Image.Resampling.LANCZOS).save(out_jpg, "JPEG", quality=95)
-                    time.sleep(5)
+                    print(f"Scene {idx+1}: Pollinations rendered!")
+                    time.sleep(15)
                     return
         except Exception:
             pass
-        time.sleep(6)
+        time.sleep(15)
 
-    raise Exception(f"Failed to generate clean 3D frame for Scene {idx+1}")
+    # 3. Last-resort smooth gradient card (never crashes workflow)
+    img = Image.new("RGB", (720, 1280), color=(25, 35, 65))
+    draw = ImageDraw.Draw(img)
+    for y in range(1280):
+        draw.line([(0, y), (720, y)], fill=(20 + int(35 * y / 1280), 30 + int(45 * y / 1280), 65 + int(75 * y / 1280)))
+    img.save(out_jpg, "JPEG", quality=90)
+    print(f"Scene {idx+1}: Styled fallback card used.")
 
 def render_scene_with_ffmpeg(img_path, audio_path, out_mp4, dur, idx):
     frames = int(dur * 30)
