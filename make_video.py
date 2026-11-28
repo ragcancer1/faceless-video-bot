@@ -120,7 +120,6 @@ def is_valid_artwork(img):
     return (20 < mean_brightness < 240) and (std_dev > 18)
 
 def create_motion_clip_from_image(img_path, target_dur, idx):
-    # Dynamic camera pan & zoom motion so every 3D frame feels alive
     base = ImageClip(img_path).with_duration(target_dur)
     if idx % 3 == 0:
         return base.resized(lambda t, d=target_dur: 1.0 + 0.10 * (t / d)).with_position(('center', 'center'))
@@ -159,7 +158,6 @@ def render_scene_visual(visual_prompt, fallback_kw, out_mp4, target_dur, idx):
             print(f"Scene {idx+1} attempt {attempt+1} retrying: {e}")
         time.sleep(6)
 
-    # Automatic Pixabay HD Video Backup so pipeline NEVER crashes
     if PIXABAY_API_KEY:
         try:
             res = requests.get(
@@ -173,18 +171,4 @@ def render_scene_visual(visual_prompt, fallback_kw, out_mp4, target_dur, idx):
                 USED_VIDEO_IDS.add(chosen["id"])
                 vid_url = chosen.get("videos", {}).get("medium", {}).get("url")
                 if vid_url:
-                    raw_p = f"temp/pb_{idx}.mp4"
-                    with open(raw_p, "wb") as f:
-                        f.write(requests.get(vid_url, timeout=40).content)
-                    clip = VideoFileClip(raw_p).without_audio()
-                    scale = max(720 / clip.w, 1280 / clip.h)
-                    clip = clip.resized(scale)
-                    clip = clip.cropped(x1=(clip.w - 720) / 2, y1=(clip.h - 1280) / 2, width=720, height=1280)
-                    if clip.duration >= target_dur:
-                        clip = clip.subclipped(0, target_dur)
-                    else:
-                        clip = concatenate_videoclips([clip] * math.ceil(target_dur / max(clip.duration, 0.5))).subclipped(0, target_dur)
-                    clip.write_videofile(out_mp4, fps=30, codec="libx264", audio=False, logger=None)
-                    print(f"Scene {idx+1}: Backup HD clip used!")
-                    return
-        except Exception
+                    raw_p = f"temp/pb_{idx}.
