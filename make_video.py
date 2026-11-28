@@ -9,7 +9,7 @@ import requests
 import yt_dlp
 import edge_tts
 from gtts import gTTS
-from PIL import Image, ImageStat
+from PIL import Image, ImageDraw, ImageStat
 from moviepy import VideoFileClip, ImageClip, AudioFileClip, concatenate_videoclips
 
 GROQ_API_KEY = os.environ["GROQ_API_KEY"].strip()
@@ -23,6 +23,7 @@ os.makedirs("temp", exist_ok=True)
 USED_VIDEO_IDS = set()
 
 STYLE_SUFFIX = "3D Pixar Disney animation style, vibrant cinematic lighting, 9:16 vertical, 8k, no text, no watermark"
+HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
 def download_audio_and_get_duration(url):
     audio_path = "temp/input_audio.mp3"
@@ -49,7 +50,7 @@ def transcribe_audio(audio_path):
     return data["text"]
 
 def rewrite_script(transcript, target_duration):
-    num_scenes = max(4, min(10, round(target_duration / 4.5)))
+    num_scenes = max(4, min(9, round(target_duration / 4.8)))
     words_per_scene = max(7, round((target_duration * 2.3) / num_scenes))
 
     prompt = f"""
@@ -57,8 +58,8 @@ def rewrite_script(transcript, target_duration):
     
     CRITICAL RULES:
     1. 'voice_hindi': Pure natural Devanagari Hindi script with Hindi words for ALL numbers (e.g., "दस अवतार", "बीस साल", "सात हज़ार"). Keep each scene around {words_per_scene} Hindi words so total narration matches ~{round(target_duration)} seconds.
-    2. 'visual_prompt': Short, vivid English prompt (MAX 22 words) describing the 3D animated scene, main character, action, and background. Keep character style consistent across scenes.
-    3. 'fallback_keyword': 2 simple English words for stock video backup if AI render times out (e.g., "ocean waves", "temple light").
+    2. 'visual_prompt': Short, vivid English prompt (MAX 18 words) describing the 3D animated scene, character, action, and background.
+    3. 'fallback_keyword': 2 simple English words for stock video backup (e.g., "ocean waves", "ancient temple", "golden light").
 
     Return ONLY valid JSON:
     {{"scenes": [{{"voice_hindi": "...", "visual_prompt": "...", "fallback_keyword": "..."}}]}}
@@ -128,67 +129,95 @@ def create_motion_clip_from_image(img_path, target_dur, idx):
     else:
         return base.resized(1.12).with_position(lambda t, d=target_dur: (int(-35 * (t / d)), 'center'))
 
-def render_scene_visual(visual_prompt, fallback_kw, out_mp4, target_dur, idx):
-    short_prompt = f"{visual_prompt[:180]}, {STYLE_SUFFIX}"
+def fetch_ai_image(short_prompt, idx):
     encoded = requests.utils.quote(short_prompt)
-
-    endpoints = [
-        f"https://image.pollinations.ai/prompt/{encoded}?width=720&height=1360&model=flux&nologo=true&seed={400 + idx * 23}",
-        f"https://image.pollinations.ai/prompt/{encoded}?width=720&height=1360&model=turbo&nologo=true&seed={500 + idx * 23}",
-        f"https://image.pollinations.ai/prompt/{encoded}?width=720&height=1360&nologo=true&seed={600 + idx * 23}"
+    # Try multiple distinct free AI image endpoints & models
+    urls = [
+        f"https://image.pollinations.ai/prompt/{encoded}?width=720&height=1360&model=flux&nologo=true&seed={random.randint(1000,99999)}",
+        f"https://image.pollinations.ai/prompt/{encoded}?width=720&height=1360&model=turbo&nologo=true&seed={random.randint(1000,99999)}",
+        f"https://pollinations.ai/p/{encoded}?width=720&height=1360&nologo=true&seed={random.randint(1000,99999)}"
     ]
-
-    for attempt in range(9):
-        url = endpoints[attempt % len(endpoints)]
+    for url in urls:
         try:
-            res = requests.get(url, timeout=75)
+            res = requests.get(url, headers=HEADERS, timeout=45)
             if res.status_code == 200 and len(res.content) > 25000:
                 candidate = Image.open(io.BytesIO(res.content)).convert("RGB")
                 if is_valid_artwork(candidate):
                     w, h = candidate.size
-                    img = candidate.crop((0, 0, w, int(h * 0.93))).resize((720, 1280), Image.Resampling.LANCZOS)
-                    img_path = f"temp/i_{idx}.jpg"
-                    img.save(img_path, "JPEG", quality=95)
-                    ic = create_motion_clip_from_image(img_path, target_dur, idx)
-                    ic.write_videofile(out_mp4, fps=30, codec="libx264", audio=False, logger=None)
-                    print(f"Scene {idx+1}: 3D Animated frame rendered!")
-                    time.sleep(5)
-                    return
-        except Exception as e:
-            print(f"Scene {idx+1} attempt {attempt+1} retrying: {e}")
-        time.sleep(6)
-
-    if PIXABAY_API_KEY:
-        try:
-            res = requests.get(
-                "https://pixabay.com/api/videos/",
-                params={"key": PIXABAY_API_KEY, "q": fallback_kw or "universe galaxy", "per_page": 6},
-                timeout=20
-            ).json()
-            hits = [v for v in res.get("hits", []) if v["id"] not in USED_VIDEO_IDS] or res.get("hits", [])
-            if hits:
-                chosen = random.choice(hits)
-                USED_VIDEO_IDS.add(chosen["id"])
-                vid_url = chosen.get("videos", {}).get("medium", {}).get("url")
-                if vid_url:
-                    raw_p = f"temp/pb_{idx}.mp4"
-                    with open(raw_p, "wb") as f:
-                        f.write(requests.get(vid_url, timeout=40).content)
-                    clip = VideoFileClip(raw_p).without_audio()
-                    scale = max(720 / clip.w, 1280 / clip.h)
-                    clip = clip.resized(scale)
-                    clip = clip.cropped(x1=(clip.w - 720) / 2, y1=(clip.h - 1280) / 2, width=720, height=1280)
-                    if clip.duration >= target_dur:
-                        clip = clip.subclipped(0, target_dur)
-                    else:
-                        clip = concatenate_videoclips([clip] * math.ceil(target_dur / max(clip.duration, 0.5))).subclipped(0, target_dur)
-                    clip.write_videofile(out_mp4, fps=30, codec="libx264", audio=False, logger=None)
-                    print(f"Scene {idx+1}: Backup HD clip used!")
-                    return
+                    return candidate.crop((0, 0, w, int(h * 0.93))).resize((720, 1280), Image.Resampling.LANCZOS)
         except Exception:
             pass
+        time.sleep(3)
 
-    raise Exception(f"Failed to render Scene {idx+1}")
+    # Try Hercai free AI image API as second independent provider
+    try:
+        h_res = requests.get(f"https://hercai.onrender.com/v3/text2image?prompt={encoded}", headers=HEADERS, timeout=45).json()
+        img_url = h_res.get("url")
+        if img_url:
+            img_data = requests.get(img_url, headers=HEADERS, timeout=30).content
+            candidate = Image.open(io.BytesIO(img_data)).convert("RGB")
+            if is_valid_artwork(candidate):
+                return candidate.resize((720, 1280), Image.Resampling.LANCZOS)
+    except Exception:
+        pass
+
+    return None
+
+def render_scene_visual(visual_prompt, fallback_kw, out_mp4, target_dur, idx):
+    short_prompt = f"{visual_prompt[:150]}, {STYLE_SUFFIX}"
+    img = fetch_ai_image(short_prompt, idx)
+
+    if img is not None:
+        img_path = f"temp/i_{idx}.jpg"
+        img.save(img_path, "JPEG", quality=95)
+        ic = create_motion_clip_from_image(img_path, target_dur, idx)
+        ic.write_videofile(out_mp4, fps=30, codec="libx264", audio=False, logger=None)
+        print(f"Scene {idx+1}: 3D AI frame rendered!")
+        time.sleep(4)
+        return
+
+    # Backup 1: Pixabay HD Stock Video matching scene topic
+    if PIXABAY_API_KEY:
+        for q in [fallback_kw, fallback_kw.split()[0] if fallback_kw else "nature", "cosmic stars"]:
+            try:
+                res = requests.get(
+                    "https://pixabay.com/api/videos/",
+                    params={"key": PIXABAY_API_KEY, "q": q, "per_page": 8},
+                    timeout=20
+                ).json()
+                hits = [v for v in res.get("hits", []) if v["id"] not in USED_VIDEO_IDS] or res.get("hits", [])
+                if hits:
+                    chosen = random.choice(hits[:5])
+                    USED_VIDEO_IDS.add(chosen["id"])
+                    vid_url = chosen.get("videos", {}).get("medium", {}).get("url") or chosen.get("videos", {}).get("small", {}).get("url")
+                    if vid_url:
+                        raw_p = f"temp/pb_{idx}.mp4"
+                        with open(raw_p, "wb") as f:
+                            f.write(requests.get(vid_url, timeout=40).content)
+                        clip = VideoFileClip(raw_p).without_audio()
+                        scale = max(720 / clip.w, 1280 / clip.h)
+                        clip = clip.resized(scale)
+                        clip = clip.cropped(x1=(clip.w - 720) / 2, y1=(clip.h - 1280) / 2, width=720, height=1280)
+                        if clip.duration >= target_dur:
+                            clip = clip.subclipped(0, target_dur)
+                        else:
+                            clip = concatenate_videoclips([clip] * math.ceil(target_dur / max(clip.duration, 0.5))).subclipped(0, target_dur)
+                        clip.write_videofile(out_mp4, fps=30, codec="libx264", audio=False, logger=None)
+                        print(f"Scene {idx+1}: Pixabay HD video clip rendered!")
+                        return
+            except Exception:
+                pass
+
+    # Backup 2: Cinematic Styled Gradient Card (never crashes workflow)
+    fb_img = Image.new("RGB", (720, 1280), color=(28, 36, 64))
+    draw = ImageDraw.Draw(fb_img)
+    for y in range(1280):
+        draw.line([(0, y), (720, y)], fill=(20 + int(30 * y / 1280), 28 + int(45 * y / 1280), 60 + int(80 * y / 1280)))
+    fb_path = f"temp/fb_{idx}.jpg"
+    fb_img.save(fb_path, "JPEG", quality=90)
+    ic = create_motion_clip_from_image(fb_path, target_dur, idx)
+    ic.write_videofile(out_mp4, fps=30, codec="libx264", audio=False, logger=None)
+    print(f"Scene {idx+1}: Gradient fallback rendered!")
 
 async def main():
     audio_file, orig_duration = download_audio_and_get_duration(VIDEO_URL)
